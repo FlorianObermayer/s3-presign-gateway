@@ -20,3 +20,28 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+  # One-off task that writes the bucket CORS rule. It needs a write-capable key,
+  # so it is opt-in: it only runs when you ask for it, and the gateway never
+  # sees these credentials.
+  #
+  #   docker compose run --rm cors-setup                  # apply
+  #   docker compose run --rm -e ACTION=show cors-setup    # inspect
+  #   docker compose run --rm -e ACTION=delete cors-setup  # remove
+  #
+  # Afterwards delete S3_ADMIN_* from the stack.
+  cors-setup:
+    profiles: ["setup"]
+    build:
+      context: .
+      target: cors-setup
+    restart: "no"
+    environment:
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_ACCESS_KEY_ID: ${S3_ADMIN_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_ADMIN_SECRET_ACCESS_KEY:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
+    security_opt:
+      - no-new-privileges:true
