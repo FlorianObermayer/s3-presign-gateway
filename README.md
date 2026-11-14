@@ -1,7 +1,9 @@
 # s3-presign-gateway
 
 Serve objects from a **private** S3-compatible bucket to browsers by redirecting
-to presigned GET URLs, with the CORS headers a redirect needs.
+to presigned GET URLs, with the CORS headers a redirect needs. HLS playlists
+(`.m3u8`) are the one exception: they are fetched, rewritten and served, so the
+browser stays on the gateway for the segments too.
 
 Written for [Owncast](https://owncast.online) HLS playback on a bucket without
 anonymous access.
@@ -11,6 +13,13 @@ anonymous access.
 A browser treats the redirect itself as a cross-origin request. Without
 `Access-Control-Allow-Origin` on the `302`, playback fails — even when the bucket
 sends perfect CORS headers on the final response.
+
+Playlists cannot be redirected for a second reason: the segment URIs inside them
+are **relative**, and the browser resolves them against the URL that served the
+playlist. After a redirect that URL is the provider, so the browser asks the
+provider for `stream-x1.ts` with no signature and gets `403`. Serving a rewritten
+playlist keeps every later request on the gateway. Only playlist bytes (a few
+KB) pass through the gateway; segments are still redirected.
 
 The `HEAD` handling exists for the same reason: SigV4 covers the HTTP method, so a
 `HEAD` against a URL signed for `GET` is rejected by the provider.
@@ -117,9 +126,10 @@ https://s3-presigned.example.com/REPLACE-WITH-24-RANDOM-CHARS
 ```
 
 Owncast appends `/hls/0/...` to that string, so playlists become
-`…/REPLACE-WITH-24-RANDOM-CHARS/hls/0/stream.m3u8`. Segment URIs inside a variant
-playlist are relative, so the token propagates to every segment with no extra
-configuration.
+`…/REPLACE-WITH-24-RANDOM-CHARS/hls/0/stream.m3u8`. The gateway serves that
+playlist with its relative segment URIs rewritten to
+`…/REPLACE-WITH-24-RANDOM-CHARS/hls/0/<segment>.ts`, so the token propagates to
+every segment with no extra configuration.
 
 A request without the token, or with a wrong one, gets `404` — the same answer
 as a nonexistent key, so the endpoint does not confirm that it exists.
@@ -169,6 +179,7 @@ can check a session — that is a proxy, at the cost of your own bandwidth.
 
 | Path | Response |
 | --- | --- |
+| `GET /<key>.m3u8` | Playlist, fetched and rewritten, `200` |
 | `GET /<key>` | `302` to a presigned URL |
 | `HEAD /<key>` | Object metadata (signed as a real `HEAD`) |
 | `OPTIONS /<key>` | CORS preflight, `204` |

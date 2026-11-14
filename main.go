@@ -11,12 +11,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"strconv"
 	"strings"
 	"syscall"
@@ -340,6 +342,13 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
+		// A playlist is served, not redirected: the browser resolves the
+		// relative segment URIs against the URL that served the playlist, so
+		// after a redirect they would hit the storage host without a signature.
+		if isPlaylist(key) {
+			g.servePlaylist(w, r, key)
+			return
+		}
 		g.redirect(w, key)
 	case http.MethodHead:
 		g.head(w, r, key)
@@ -415,9 +424,88 @@ func (g *gateway) head(w http.ResponseWriter, r *http.Request, key string) {
 	w.WriteHeader(resp.StatusCode)
 }
 
-// objectKey turns a request path into a bucket key, rejecting anything that
-// could escape the configured prefix.
-// stripToken removes a leading /<token> segment and returns the remaining path.
+// isPlaylist reports whether key is an HLS playlist that needs its relative
+// URIs rewritten.
+func isPlaylist(key string) bool {
+	return strings.HasSuffix(strings.ToLower(key), ".m3u8")
+}
+
+// servePlaylist fetches an HLS playlist and rewrites it so every relative URI
+// points back at this gateway instead of at the storage host.
+//
+// Redirecting a playlist does not work: the browser resolves the relative
+// segment URIs against the URL it fetched the playlist from, which after the
+// redirect is the provider, and those requests carry no signature. Serving the
+// playlist itself keeps the browser on the gateway for the next hop too.
+func (g *gateway) servePlaylist(w http.ResponseWriter, r *http.Request, key string) {
+	presigned, err := g.signer.presign(key, g.cfg.ttl)
+	if err != nil {
+		log.Printf("presign %q: %v", key, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, presigned, nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	resp, err := g.client.Do(req)
+	if err != nil {
+		log.Printf("fetch playlist %q: %v", key, err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		w.WriteHeader(resp.StatusCode)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		log.Printf("read playlist %q: %v", key, err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+
+	rewritten := g.rewritePlaylist(body, r.URL.Path)
+
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(rewritten)
+}
+
+// rewritePlaylist turns relative playlist URIs into paths on this gateway.
+// Absolute URIs and comments are left alone, so a playlist that already points
+// somewhere (a CDN, say) keeps working.
+//
+// requestPath must still carry the access token: the rewritten URIs are
+// requested by the browser next, and without the token they would 404.
+func (g *gateway) rewritePlaylist(body []byte, requestPath string) []byte {
+	base := "/"
+	if i := strings.LastIndex(requestPath, "/"); i >= 0 {
+		base = requestPath[:i+1]
+	}
+
+	lines := strings.Split(string(body), "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(trimmed, "://") || strings.HasPrefix(trimmed, "/") {
+			continue
+		}
+		// Resolve against the playlist's directory, normalising any ../.
+		lines[i] = path.Join(base, trimmed)
+	}
+	return []byte(strings.Join(lines, "\n"))
+}
+
+// stripToken removes a leading access token from the request path.
 // Without configured tokens the path is returned unchanged, so the feature is
 // purely opt-in. The comparison is constant time to avoid leaking a prefix
 // match through timing.
@@ -444,8 +532,10 @@ func (g *gateway) stripToken(path string) (string, bool) {
 	return "/" + tail, true
 }
 
-func (g *gateway) objectKey(path string) (string, bool) {
-	key := strings.TrimPrefix(path, "/")
+// objectKey turns a request path into a bucket key, rejecting anything that
+// could escape the configured prefix.
+func (g *gateway) objectKey(requestPath string) (string, bool) {
+	key := strings.TrimPrefix(requestPath, "/")
 	if key == "" || len(key) > 1024 {
 		return "", false
 	}

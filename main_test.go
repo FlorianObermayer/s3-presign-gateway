@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -49,7 +51,7 @@ func requestWithOrigin(g *gateway, method, target, origin string) *http.Response
 }
 
 func TestCORSDefaultsToWildcard(t *testing.T) {
-	resp := request(testGateway(t, nil), http.MethodGet, "/hls/stream.m3u8")
+	resp := request(testGateway(t, nil), http.MethodGet, "/hls/stream.ts")
 	defer resp.Body.Close()
 
 	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
@@ -64,7 +66,7 @@ func TestCORSAllowsConfiguredOrigin(t *testing.T) {
 	g := testGateway(t, func(c *config) {
 		c.corsOrigins = []string{"https://streaming.example.com"}
 	})
-	resp := requestWithOrigin(g, http.MethodGet, "/hls/stream.m3u8", "https://streaming.example.com")
+	resp := requestWithOrigin(g, http.MethodGet, "/hls/stream.ts", "https://streaming.example.com")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusFound {
@@ -82,7 +84,7 @@ func TestCORSRejectsOtherOrigins(t *testing.T) {
 	g := testGateway(t, func(c *config) {
 		c.corsOrigins = []string{"https://streaming.example.com"}
 	})
-	resp := requestWithOrigin(g, http.MethodGet, "/hls/stream.m3u8", "https://evil.example.com")
+	resp := requestWithOrigin(g, http.MethodGet, "/hls/stream.ts", "https://evil.example.com")
 	defer resp.Body.Close()
 
 	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
@@ -102,7 +104,7 @@ func TestCORSIgnoresRequestsWithoutOrigin(t *testing.T) {
 		c.corsOrigins = []string{"https://streaming.example.com"}
 	})
 	// Native players send no Origin and still need the redirect.
-	resp := request(g, http.MethodGet, "/hls/stream.m3u8")
+	resp := request(g, http.MethodGet, "/hls/stream.ts")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusFound {
@@ -187,13 +189,13 @@ func TestParseOriginsAllowsPort(t *testing.T) {
 }
 
 func TestRedirectIsPresignedAndCORSReadable(t *testing.T) {
-	resp := request(testGateway(t, nil), http.MethodGet, "/hls/stream.m3u8")
+	resp := request(testGateway(t, nil), http.MethodGet, "/hls/stream.ts")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("expected 302, got %d", resp.StatusCode)
 	}
-	if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "https://s3.example.com/bucket/hls/stream.m3u8?X-Amz-Signature=") &&
+	if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "https://s3.example.com/bucket/hls/stream.ts?X-Amz-Signature=") &&
 		!strings.Contains(loc, "X-Amz-Signature=") {
 		t.Fatalf("location is not presigned: %s", loc)
 	}
@@ -286,7 +288,7 @@ func TestTokenRequired(t *testing.T) {
 	})
 
 	// Without the token the object is invisible.
-	resp := requestWithOrigin(g, http.MethodGet, "/hls/stream.m3u8", "")
+	resp := requestWithOrigin(g, http.MethodGet, "/hls/stream.ts", "")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404 without token, got %d", resp.StatusCode)
@@ -296,12 +298,12 @@ func TestTokenRequired(t *testing.T) {
 	}
 
 	// With the token in front of the key it works, and the token is stripped.
-	resp = requestWithOrigin(g, http.MethodGet, "/s3cr3t-token-value-1234/hls/stream.m3u8", "")
+	resp = requestWithOrigin(g, http.MethodGet, "/s3cr3t-token-value-1234/hls/stream.ts", "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("expected 302 with token, got %d", resp.StatusCode)
 	}
-	if loc := resp.Header.Get("Location"); !strings.Contains(loc, "/bucket/hls/stream.m3u8?") {
+	if loc := resp.Header.Get("Location"); !strings.Contains(loc, "/bucket/hls/stream.ts?") {
 		t.Fatalf("token leaked into the key or was not stripped: %s", loc)
 	}
 }
@@ -344,7 +346,7 @@ func TestTokenRotationAcceptsBoth(t *testing.T) {
 		}
 	})
 	for _, token := range []string{"old-token-value-123456", "new-token-value-123456"} {
-		resp := request(g, http.MethodGet, "/"+token+"/hls/stream.m3u8")
+		resp := request(g, http.MethodGet, "/"+token+"/hls/stream.ts")
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusFound {
 			t.Fatalf("%s: expected 302, got %d", token, resp.StatusCode)
@@ -393,6 +395,173 @@ func TestParseTokens(t *testing.T) {
 			}
 			if len(got) != tc.want {
 				t.Fatalf("got %d tokens, want %d", len(got), tc.want)
+			}
+		})
+	}
+}
+
+// --- HLS playlists ---------------------------------------------------------
+
+func readBody(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// playlistUpstream answers every request with a small VOD playlist whose
+// segment URIs are relative, the way Owncast writes them.
+func playlistUpstream(t *testing.T, method, query *string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*method, *query = r.Method, r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		fmt.Fprint(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n"+
+			"#EXTINF:2.000,\nstream-abc-1.ts\n#EXTINF:2.000,\nstream-abc-2.ts\n#EXT-X-ENDLIST\n")
+	}))
+}
+
+// TestPlaylistIsServedAndRewritten is the regression test for the bug that a
+// redirect leaves the browser on the storage host: relative segment URIs then
+// resolve there, unsigned, and every segment is rejected with 403.
+func TestPlaylistIsServedAndRewritten(t *testing.T) {
+	var method, query string
+	upstream := playlistUpstream(t, &method, &query)
+	defer upstream.Close()
+
+	endpoint, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := testGateway(t, func(c *config) {
+		c.endpoint = endpoint
+		c.accessTokens = [][]byte{[]byte("s3cr3t-token-value-1234")}
+	})
+
+	resp := request(g, http.MethodGet, "/s3cr3t-token-value-1234/hls/1/stream.m3u8")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Fatalf("a playlist must be served, not redirected: %s", loc)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/vnd.apple.mpegurl" {
+		t.Fatalf("unexpected content type %q", ct)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("playlists must not be cached, got %q", got)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("missing CORS header, got %q", got)
+	}
+	if method != http.MethodGet || !strings.Contains(query, "X-Amz-Signature=") {
+		t.Fatalf("upstream request was not a presigned GET: %s %q", method, query)
+	}
+
+	body := readBody(t, resp)
+	// The token must survive: the browser requests these URIs next.
+	for _, want := range []string{
+		"/s3cr3t-token-value-1234/hls/1/stream-abc-1.ts",
+		"/s3cr3t-token-value-1234/hls/1/stream-abc-2.ts",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "\nstream-abc-1.ts") {
+		t.Fatalf("relative URI left unrewritten:\n%s", body)
+	}
+}
+
+func TestPlaylistUpstreamStatusForwarded(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no such key", http.StatusNotFound)
+	}))
+	defer upstream.Close()
+
+	endpoint, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := testGateway(t, func(c *config) { c.endpoint = endpoint })
+
+	resp := request(g, http.MethodGet, "/hls/missing.m3u8")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected upstream 404, got %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Fatalf("must not redirect: %s", loc)
+	}
+}
+
+func TestIsPlaylist(t *testing.T) {
+	for _, key := range []string{"a/b.m3u8", "a/b.M3U8"} {
+		if !isPlaylist(key) {
+			t.Fatalf("%q should be a playlist", key)
+		}
+	}
+	for _, key := range []string{"a/b.ts", "a/b.m3u8.txt", "m3u8"} {
+		if isPlaylist(key) {
+			t.Fatalf("%q should not be a playlist", key)
+		}
+	}
+}
+
+func TestRewritePlaylist(t *testing.T) {
+	g := &gateway{}
+	tests := []struct {
+		name string
+		path string
+		in   string
+		want string
+	}{
+		{
+			name: "relative segments resolved against the directory",
+			path: "/tok/hls/1/stream.m3u8",
+			in:   "#EXTM3U\na.ts\nb.ts\n",
+			want: "#EXTM3U\n/tok/hls/1/a.ts\n/tok/hls/1/b.ts\n",
+		},
+		{
+			name: "nested relative path",
+			path: "/tok/hls/1/stream.m3u8",
+			in:   "sub/c.ts\n",
+			want: "/tok/hls/1/sub/c.ts\n",
+		},
+		{
+			name: "parent traversal is normalised",
+			path: "/tok/hls/1/stream.m3u8",
+			in:   "../0/d.ts\n",
+			want: "/tok/hls/0/d.ts\n",
+		},
+		{
+			name: "absolute paths are left alone",
+			path: "/tok/hls/1/stream.m3u8",
+			in:   "/cdn/e.ts\n",
+			want: "/cdn/e.ts\n",
+		},
+		{
+			name: "absolute URLs are left alone",
+			path: "/tok/hls/1/stream.m3u8",
+			in:   "https://cdn.example/f.ts\n",
+			want: "https://cdn.example/f.ts\n",
+		},
+		{
+			name: "comments and blank lines are untouched",
+			path: "/tok/hls/1/stream.m3u8",
+			in:   "#EXTM3U\n\n#EXT-X-ENDLIST\n",
+			want: "#EXTM3U\n\n#EXT-X-ENDLIST\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := string(g.rewritePlaylist([]byte(tc.in), tc.path))
+			if got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})
 	}
