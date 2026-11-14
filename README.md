@@ -148,12 +148,16 @@ make test
 make docker
 ```
 
-Publish a release by pushing a tag — CI builds and pushes a multi-arch image to
-GHCR:
+Publish a release by pushing a tag — CI publishes a GitHub Release with binaries
+for linux/darwin/windows on amd64/arm64 plus `checksums.txt`, and pushes a
+multi-arch image to GHCR:
 
 ```bash
 git tag v1.0.0 && git push origin v1.0.0
 ```
+
+Images: `<repo>:v1.0.0` (gateway) and `<repo>:v1.0.0-cors` (CORS setup task),
+each also tagged `latest`.
 
 The SigV4 code is covered by the AWS documentation test vector (`sigv4_test.go`).
 
