@@ -60,13 +60,29 @@ bucket rule; see [Setting the rule with `-setup-cors`](#setting-the-rule-with--s
 | `CORS_ALLOWED_ORIGINS` | `*` | Comma separated origins allowed to read the stream. |
 | `LISTEN_ADDR` | `:8080` | Listen address. |
 
-`CORS_ALLOWED_ORIGINS` is used by the gateway **and** by the CORS setup task, so
-the redirect and the bucket rule always agree. Pin both to the page that embeds
-the player:
+`CORS_ALLOWED_ORIGINS` configures the gateway **and** the CORS setup task, so by
+default both sides agree. Pin it to the page that embeds the player:
 
 ```bash
 -e CORS_ALLOWED_ORIGINS=https://streaming.example.com
 ```
+
+One exception: in redirect mode Firefox sends `Origin: null` when following the
+cross-origin `302` to the provider (see the Owncast section). If you need
+Firefox support, leave the **bucket** permissive and pin only the gateway — run
+the setup task once with `*`, then keep the gateway pinned:
+
+```bash
+# bucket: accept any Origin, including null
+docker run --rm ... -e CORS_ALLOWED_ORIGINS='*' <image> -setup-cors
+
+# gateway: still only mints URLs for your page
+-e CORS_ALLOWED_ORIGINS=https://streaming.example.com
+```
+
+Only the gateway can hand out presigned URLs, so it is the side worth
+restricting; the bucket rule just governs which pages may read a URL they
+already hold.
 
 Several origins are comma separated:
 
@@ -106,8 +122,7 @@ Everything else returns `404` (key outside `ALLOW_PREFIX`) or `405`.
 The bucket still needs a CORS rule, because browsers read the final response
 from the provider too:
 
-```xml
-<CORSConfiguration>
+```xml<CORSConfiguration>
   <CORSRule>
     <AllowedOrigin>*</AllowedOrigin>
     <AllowedMethod>GET</AllowedMethod>
@@ -124,6 +139,15 @@ from the provider too:
 
 Create it with the AWS CLI or any S3 tool (`PutBucketCors`). Verified working on
 Intercolo i3 (€storage); `response-content-type` overrides are ignored there.
+
+> **Keep the bucket rule permissive (`*`), even when the gateway is pinned.**
+> In redirect mode the browser follows a cross-origin `302` to the provider, and
+> Firefox sends `Origin: null` on that follow-up request. A rule listing only
+> your site therefore returns no `Access-Control-Allow-Origin` for it, and
+> playback fails with *"CORS Missing Allow Origin"* even though the gateway is
+> configured correctly. Chromium keeps the real origin, so the bug shows up in
+> Firefox only. Pinning the **gateway** is what limits who can obtain a
+> presigned URL; CORS on the bucket is not an access control (the signature is).
 
 ### Setting the rule with `-setup-cors`
 
