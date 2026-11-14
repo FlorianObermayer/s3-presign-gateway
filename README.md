@@ -120,28 +120,44 @@ structure as **JSON** — that is what the task below generates.
 
 ### Setting the rule with the bundled task
 
-`scripts/setup-cors.sh` writes that rule for you. It lives in its own build stage
-on top of the AWS CLI image, so the gateway image stays shell-free and never
-receives a write-capable key.
+`scripts/setup-cors.sh` writes that rule for you. It is published as a separate
+image tag (`-cors`, built on the AWS CLI image), so the gateway image stays
+shell-free and never receives a write-capable key.
+
+Run it directly, no build required:
 
 ```bash
-docker build --target cors-setup -t s3-presign-gateway-cors .
 docker run --rm \
   -e S3_ENDPOINT=https://de-fra.i3storage.com \
   -e S3_BUCKET=example-bucket \
   -e S3_REGION=de-fra \
   -e S3_ACCESS_KEY_ID=... \
   -e S3_SECRET_ACCESS_KEY=... \
-  s3-presign-gateway-cors
+  -e CORS_ALLOWED_ORIGINS=https://streaming.example.com \
+  ghcr.io/florianobermayer/s3-presign-gateway:latest-cors
 ```
 
-Or through compose, which reads the `S3_ADMIN_*` values from `.env`:
+Or through compose, which reads the `S3_ADMIN_*` values from `.env`
+(add `--build` to use a local build instead of the published image):
 
 ```bash
 make cors                  # apply
 make cors ACTION=show      # print the current rule
 make cors ACTION=delete    # remove it
 ```
+
+### Running it in Portainer
+
+Portainer has no `compose run`, so use a throwaway container:
+
+1. **Containers → Add container**
+2. Image: `ghcr.io/florianobermayer/s3-presign-gateway:latest-cors`
+3. Add the environment variables below (use the *Advanced mode* bulk editor)
+4. **Deploy the container** — it runs once, prints the rule, and exits
+5. Remove the container when done
+
+Deliberately reusing the one-off container is fine: set `ACTION=show` to inspect
+without changing anything, then run it again with `ACTION=apply`.
 
 | Variable | Default | Description |
 | --- | --- | --- |

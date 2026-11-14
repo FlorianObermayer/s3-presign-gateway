@@ -33,8 +33,12 @@ services:
   #   docker compose run --rm -e ACTION=delete cors-setup  # remove
   #
   # Afterwards delete S3_ADMIN_* from the stack.
+  #
+  # The published -cors image is used so no local build is needed; add
+  # `--build` to build it from this repository instead.
   cors-setup:
     profiles: ["setup"]
+    image: ghcr.io/florianobermayer/s3-presign-gateway:latest-cors
     build:
       context: .
       target: cors-setup
