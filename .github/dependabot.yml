@@ -1,0 +1,59 @@
+version: 2
+
+# Supply chain posture:
+#  * every GitHub Action is pinned to a full commit SHA,
+#  * every Docker base image is pinned to a digest,
+#  * new releases are only adopted after a cooldown, so a compromised or
+#    yanked version does not land here the hour it is published.
+#
+# Dependabot keeps all three ecosystems current; review the diff before merging.
+
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 3
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 3
+    commit-message:
+      prefix: "chore(ci)"
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      container-images:
+        patterns:
+          - "*"
+    # Docker has no SemVer, so only the plain cooldown applies here.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(docker)"
