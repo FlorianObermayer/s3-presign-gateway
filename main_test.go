@@ -279,3 +279,121 @@ func TestHealth(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 }
+
+func TestTokenRequired(t *testing.T) {
+	g := testGateway(t, func(c *config) {
+		c.accessTokens = [][]byte{[]byte("s3cr3t-token-value-1234")}
+	})
+
+	// Without the token the object is invisible.
+	resp := requestWithOrigin(g, http.MethodGet, "/hls/stream.m3u8", "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 without token, got %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Fatal("must not redirect without a token")
+	}
+
+	// With the token in front of the key it works, and the token is stripped.
+	resp = requestWithOrigin(g, http.MethodGet, "/s3cr3t-token-value-1234/hls/stream.m3u8", "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 with token, got %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); !strings.Contains(loc, "/bucket/hls/stream.m3u8?") {
+		t.Fatalf("token leaked into the key or was not stripped: %s", loc)
+	}
+}
+
+func TestWrongTokenIsNotFound(t *testing.T) {
+	g := testGateway(t, func(c *config) {
+		c.accessTokens = [][]byte{[]byte("s3cr3t-token-value-1234")}
+	})
+
+	for _, path := range []string{
+		"/wrong-token-value-12345/hls/stream.m3u8",
+		"/s3cr3t-token-value-123/hls/stream.m3u8", // prefix of the real token
+		"/s3cr3t-token-value-1234",
+	} {
+		resp := request(g, http.MethodGet, path)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s: expected 404, got %d", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestHealthBypassesToken(t *testing.T) {
+	g := testGateway(t, func(c *config) {
+		c.accessTokens = [][]byte{[]byte("s3cr3t-token-value-1234")}
+	})
+	// The container healthcheck must keep working without knowing the token.
+	resp := request(g, http.MethodGet, "/healthz")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestTokenRotationAcceptsBoth(t *testing.T) {
+	g := testGateway(t, func(c *config) {
+		c.accessTokens = [][]byte{
+			[]byte("old-token-value-123456"),
+			[]byte("new-token-value-123456"),
+		}
+	})
+	for _, token := range []string{"old-token-value-123456", "new-token-value-123456"} {
+		resp := request(g, http.MethodGet, "/"+token+"/hls/stream.m3u8")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusFound {
+			t.Fatalf("%s: expected 302, got %d", token, resp.StatusCode)
+		}
+	}
+}
+
+func TestTokenRequiredForPreflight(t *testing.T) {
+	g := testGateway(t, func(c *config) {
+		c.accessTokens = [][]byte{[]byte("s3cr3t-token-value-1234")}
+	})
+	resp := request(g, http.MethodOptions, "/hls/0/a.ts")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for tokenless preflight, got %d", resp.StatusCode)
+	}
+}
+
+func TestParseTokens(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    int
+		wantErr bool
+	}{
+		{name: "empty disables the feature", in: "", want: 0},
+		{name: "single", in: "abcdefghijklmnop", want: 1},
+		{name: "list with spaces", in: " abcdefghijklmnop , qrstuvwxyz123456 ", want: 2},
+		{name: "empty entries ignored", in: "abcdefghijklmnop,,", want: 1},
+		{name: "too short", in: "tolong", wantErr: true},
+		{name: "contains slash", in: "abcdefghij/klmnop", wantErr: true},
+		{name: "contains space", in: "abcdefghij klmnop", wantErr: true},
+		{name: "contains query marker", in: "abcdefghijklmnop?", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseTokens(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error for %q", tc.in)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(got) != tc.want {
+				t.Fatalf("got %d tokens, want %d", len(got), tc.want)
+			}
+		})
+	}
+}

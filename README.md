@@ -58,6 +58,7 @@ bucket rule; see [Setting the rule with `-setup-cors`](#setting-the-rule-with--s
 | `ALLOW_PREFIX` | — | Only serve keys under this prefix. Empty = whole bucket. |
 | `PRESIGN_TTL_SECONDS` | `300` | Presigned URL lifetime, 1–604800. |
 | `CORS_ALLOWED_ORIGINS` | `*` | Comma separated origins allowed to read the stream. |
+| `ACCESS_TOKENS` | — | Optional secret path prefix; see [Keeping the URL unlisted](#keeping-the-url-unlisted). |
 | `LISTEN_ADDR` | `:8080` | Listen address. |
 
 `CORS_ALLOWED_ORIGINS` configures the gateway **and** the CORS setup task, so by
@@ -100,6 +101,70 @@ The browser sends that page's origin on the redirect *and* on the presigned
 request, so both responses need to allow it. Requests without an `Origin` header
 (VLC, ffmpeg, curl) are unaffected.
 
+## Keeping the URL unlisted
+
+Optional, off by default. Set `ACCESS_TOKENS` to require a secret as the first
+path segment:
+
+```bash
+ACCESS_TOKENS=REPLACE-WITH-24-RANDOM-CHARS
+```
+
+Then point Owncast's **Serving Endpoint** at the gateway *including* the token:
+
+```
+https://s3-presigned.example.com/REPLACE-WITH-24-RANDOM-CHARS
+```
+
+Owncast appends `/hls/0/...` to that string, so playlists become
+`…/REPLACE-WITH-24-RANDOM-CHARS/hls/0/stream.m3u8`. Segment URIs inside a variant
+playlist are relative, so the token propagates to every segment with no extra
+configuration.
+
+A request without the token, or with a wrong one, gets `404` — the same answer
+as a nonexistent key, so the endpoint does not confirm that it exists.
+`/healthz` stays open so the container healthcheck keeps working. The check is
+constant time, and a wrong token never reaches the signer.
+
+Generate one:
+
+```bash
+openssl rand -base64 24 | tr -d '/+=' | cut -c1-24
+```
+
+### Rotating
+
+`ACCESS_TOKENS` takes a comma separated list, so rotation needs no downtime:
+
+```bash
+ACCESS_TOKENS=old-token-0000000000,new-token-1111111111   # accept both
+# update the Serving Endpoint in Owncast, restart Owncast
+ACCESS_TOKENS=new-token-1111111111                        # drop the old one
+```
+
+### What this does and does not buy
+
+This is obscurity, not authentication — know its limits before relying on it:
+
+- **It stops scanning and casual linking.** Someone who guesses or scrapes the
+  URL pattern gets nothing, and a leaked playlist URL without the token is
+  useless.
+- **Anyone who can load your player can read the token.** It is in the playlist
+  the browser fetches, so devtools, HAR exports and browser extensions reveal
+  it.
+- **It leaks into logs.** Tokens in URLs end up in reverse-proxy access logs,
+  `Referer` headers (if the media URL is ever navigated to) and analytics. Keep
+  it out of anything that logs full URLs, or terminate it on a host you control.
+- **No per-request authorisation, no rate limiting, no revocation of issued
+  links.** Rotating the token only helps until the next leak; presigned URLs
+  already handed out remain valid until their TTL expires.
+- **It is only as private as the playlist.** If the Owncast page itself is
+  public, the token is public too. Behind basic auth (as intended) it is a
+  second, independent barrier.
+
+For real access control you need the object bytes to pass through something that
+can check a session — that is a proxy, at the cost of your own bandwidth.
+
 ## Endpoints
 
 | Path | Response |
@@ -117,7 +182,11 @@ Everything else returns `404` (key outside `ALLOW_PREFIX`) or `405`.
    S3 storage. Stream once so `hls/...` objects exist.
 2. Set the **video serving endpoint** (`servingEndpoint`) to this gateway, e.g.
    `https://media.example.com`. Playlists then point at
-   `https://media.example.com/hls/0/...`.
+   `https://media.example.com/hls/0/...`. If you use `ACCESS_TOKENS`, include the
+   token in this URL: `https://media.example.com/<token>`.
+   The field lives under **Server Setup → Server Config → Advanced Settings** →
+   *Serving Endpoint*, not in the S3 panel, and Owncast reads it at startup —
+   restart it after changing it.
 
 The bucket still needs a CORS rule, because browsers read the final response
 from the provider too:

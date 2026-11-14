@@ -26,6 +26,8 @@ services:
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
       ALLOW_PREFIX: ${ALLOW_PREFIX:-hls/}
       PRESIGN_TTL_SECONDS: ${PRESIGN_TTL_SECONDS:-300}
+      # Optional: a secret path prefix that every request must carry.
+      ACCESS_TOKENS: ${ACCESS_TOKENS:-}
       # Keep this identical to the bucket CORS rule: the browser sends the
       # page's origin on both the redirect and the presigned request.
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}

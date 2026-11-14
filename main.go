@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"flag"
 	"fmt"
@@ -119,6 +120,9 @@ type config struct {
 	prefix    string
 	// corsOrigins is empty when every origin is allowed.
 	corsOrigins []string
+	// accessTokens is empty when no token is required. Each entry is a secret
+	// path prefix that must match the first URL segment.
+	accessTokens [][]byte
 }
 
 func loadConfig() (*config, error) {
@@ -175,7 +179,38 @@ func loadConfig() (*config, error) {
 	}
 	cfg.corsOrigins = origins
 
+	tokens, err := parseTokens(os.Getenv("ACCESS_TOKENS"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.accessTokens = tokens
+
 	return cfg, nil
+}
+
+// minTokenLength keeps a shared secret out of brute-force range. 16 characters
+// of a random alphabet is already far beyond what guessing can reach, but a
+// short human-typed word is not.
+const minTokenLength = 16
+
+// parseTokens reads a comma separated list so a token can be rotated without
+// downtime: add the new one, switch Owncast over, then drop the old one.
+func parseTokens(raw string) ([][]byte, error) {
+	var tokens [][]byte
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if len(entry) < minTokenLength {
+			return nil, fmt.Errorf("ACCESS_TOKENS entry must be at least %d characters", minTokenLength)
+		}
+		if strings.ContainsAny(entry, "/\\?# ") {
+			return nil, fmt.Errorf("ACCESS_TOKENS entry %q must not contain slashes, whitespace or URL punctuation", entry)
+		}
+		tokens = append(tokens, []byte(entry))
+	}
+	return tokens, nil
 }
 
 // parseOrigins turns a comma separated origin list into a slice. "*" yields
@@ -289,7 +324,15 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key, ok := g.objectKey(r.URL.Path)
+	path, ok := g.stripToken(r.URL.Path)
+	if !ok {
+		// Deliberately 404 rather than 403: a wrong token should be
+		// indistinguishable from a path that does not exist.
+		http.NotFound(w, r)
+		return
+	}
+
+	key, ok := g.objectKey(path)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -374,6 +417,33 @@ func (g *gateway) head(w http.ResponseWriter, r *http.Request, key string) {
 
 // objectKey turns a request path into a bucket key, rejecting anything that
 // could escape the configured prefix.
+// stripToken removes a leading /<token> segment and returns the remaining path.
+// Without configured tokens the path is returned unchanged, so the feature is
+// purely opt-in. The comparison is constant time to avoid leaking a prefix
+// match through timing.
+func (g *gateway) stripToken(path string) (string, bool) {
+	if len(g.cfg.accessTokens) == 0 {
+		return path, true
+	}
+
+	rest := strings.TrimPrefix(path, "/")
+	segment, tail, _ := strings.Cut(rest, "/")
+	candidate := []byte(segment)
+
+	matched := false
+	for _, token := range g.cfg.accessTokens {
+		// ConstantTimeCompare returns 0 on differing lengths, and it must run
+		// for every token regardless of an earlier match.
+		if subtle.ConstantTimeCompare(candidate, token) == 1 {
+			matched = true
+		}
+	}
+	if !matched {
+		return "", false
+	}
+	return "/" + tail, true
+}
+
 func (g *gateway) objectKey(path string) (string, bool) {
 	key := strings.TrimPrefix(path, "/")
 	if key == "" || len(key) > 1024 {
