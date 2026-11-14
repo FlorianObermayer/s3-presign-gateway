@@ -115,16 +115,9 @@ from the provider too:
 Create it with the AWS CLI or any S3 tool (`PutBucketCors`). Verified working on
 Intercolo i3 (€storage); `response-content-type` overrides are ignored there.
 
-The API takes XML as shown above, but `aws s3api put-bucket-cors` expects the same
-structure as **JSON** — that is what the task below generates.
+### Setting the rule with `-setup-cors`
 
-### Setting the rule with the bundled task
-
-`scripts/setup-cors.sh` writes that rule for you. It is published as a separate
-image tag (`-cors`, built on the AWS CLI image), so the gateway image stays
-shell-free and never receives a write-capable key.
-
-Run it directly, no build required:
+The same binary writes that rule for you; no extra image, no AWS CLI, no shell:
 
 ```bash
 docker run --rm \
@@ -134,11 +127,17 @@ docker run --rm \
   -e S3_ACCESS_KEY_ID=... \
   -e S3_SECRET_ACCESS_KEY=... \
   -e CORS_ALLOWED_ORIGINS=https://streaming.example.com \
-  ghcr.io/florianobermayer/s3-presign-gateway:latest-cors
+  ghcr.io/florianobermayer/s3-presign-gateway:latest -setup-cors
 ```
 
-Or through compose, which reads the `S3_ADMIN_*` values from `.env`
-(add `--build` to use a local build instead of the published image):
+`ACTION` (or `-action`) selects what to do; the default is `apply`:
+
+```bash
+... -setup-cors -action=show     # print the current rule
+... -setup-cors -action=delete   # remove it
+```
+
+Or through compose, which reads the `S3_ADMIN_*` values from `.env`:
 
 ```bash
 make cors                  # apply
@@ -151,32 +150,33 @@ make cors ACTION=delete    # remove it
 Portainer has no `compose run`, so use a throwaway container:
 
 1. **Containers → Add container**
-2. Image: `ghcr.io/florianobermayer/s3-presign-gateway:latest-cors`
-3. Add the environment variables below (use the *Advanced mode* bulk editor)
-4. **Deploy the container** — it runs once, prints the rule, and exits
-5. Remove the container when done
+2. Image: `ghcr.io/florianobermayer/s3-presign-gateway:latest`
+3. **Override → Command:** `-setup-cors`
+4. Add the environment variables below (use the *Advanced mode* bulk editor)
+5. **Deploy the container** — it runs once, prints the rule, and exits
+6. Remove the container when done
 
-Deliberately reusing the one-off container is fine: set `ACTION=show` to inspect
-without changing anything, then run it again with `ACTION=apply`.
+Start with `ACTION=show` to inspect without changing anything, then run again
+with `ACTION=apply`.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `ACTION` | `apply` | `apply`, `delete` or `show`. |
-| `S3_ACCESS_KEY_ID` | — | **Required.** Falls back to `AWS_ACCESS_KEY_ID`. Needs `PutBucketCors`. |
-| `S3_SECRET_ACCESS_KEY` | — | **Required.** Falls back to `AWS_SECRET_ACCESS_KEY`. |
+| `ACTION` | `apply` | `apply`, `delete` or `show`. `-action` overrides it. |
+| `S3_ACCESS_KEY_ID` | — | **Required.** Needs `PutBucketCors`. Also `_FILE`. |
+| `S3_SECRET_ACCESS_KEY` | — | **Required.** Also `_FILE`. |
 | `CORS_ALLOWED_ORIGINS` | `*` | Comma separated origins. Shared with the gateway, so one value configures both. |
 | `CORS_ALLOWED_METHODS` | `GET,HEAD` | |
 | `CORS_ALLOWED_HEADERS` | `*` | |
 | `CORS_EXPOSE_HEADERS` | `ETag,Content-Length,Content-Range,Accept-Ranges` | |
 | `CORS_MAX_AGE_SECONDS` | `3600` | Empty omits the element. |
 
-The task prints the stored rule afterwards and then exits. Nothing of it
-remains on disk, and the write key is only ever passed to that container — the
+The task prints the stored rule afterwards and then exits. Nothing persists on
+disk, and the write-capable key only ever reaches that one-shot container — the
 gateway service is not given it, so keep `S3_ADMIN_*` out of the running stack
 once the rule is in place.
 
-The image is built on the official AWS CLI image (~470 MB), which is fine for a
-throwaway one-shot task; the gateway image stays at a few megabytes.
+The rule is written with the existing SigV4 signer, so it is a plain signed
+`PutBucketCors` with no dependency on the AWS CLI.
 
 ## Development
 
@@ -197,8 +197,9 @@ multi-arch image to GHCR:
 git tag v1.0.0 && git push origin v1.0.0
 ```
 
-Images: `<repo>:v1.0.0` (gateway) and `<repo>:v1.0.0-cors` (CORS setup task),
-each also tagged `latest`.
+Images: `<repo>:v1.0.0` (gateway and one-shot CORS task in one binary), also
+tagged `latest`. The binary takes `-setup-cors` for bucket configuration and
+runs as the HTTP server otherwise.
 
 The SigV4 code is covered by the AWS documentation test vector (`sigv4_test.go`).
 

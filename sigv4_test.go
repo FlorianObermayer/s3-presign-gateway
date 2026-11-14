@@ -86,7 +86,7 @@ func TestSignSetsHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.sign(req)
+	s.sign(req, "")
 
 	if req.Header.Get("x-amz-content-sha256") != emptyPayloadSHA {
 		t.Fatal("missing payload hash")

@@ -76,13 +76,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    strategy:
-      matrix:
-        include:
-          - target: runtime
-            suffix: ""
-          - target: cors-setup
-            suffix: "-cors"
     steps:
       - uses: actions/checkout@v4
       - name: Resolve lowercase image name
@@ -97,10 +90,9 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: VERSION=${{ github.ref_name }}
           tags: |
-            ${{ steps.image.outputs.name }}:${{ github.ref_name }}${{ matrix.suffix }}
-            ${{ steps.image.outputs.name }}:latest${{ matrix.suffix }}
+            ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+            ${{ steps.image.outputs.name }}:latest

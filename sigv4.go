@@ -84,26 +84,30 @@ func (s *signer) presign(key string, ttl time.Duration) (string, error) {
 	return u.String(), nil
 }
 
-// sign adds header based authentication to an outbound request.
-func (s *signer) sign(req *http.Request) {
+// sign adds header based authentication to an outbound request. payloadSHA is
+// the hex SHA-256 of the request body, or emptyPayloadSHA when there is none.
+func (s *signer) sign(req *http.Request, payloadSHA string) {
+	if payloadSHA == "" {
+		payloadSHA = emptyPayloadSHA
+	}
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	date := now.Format("20060102")
 	scope := date + "/" + s.region + "/" + service + "/aws4_request"
 
 	req.Header.Set("x-amz-date", amzDate)
-	req.Header.Set("x-amz-content-sha256", emptyPayloadSHA)
+	req.Header.Set("x-amz-content-sha256", payloadSHA)
 
 	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
 	canonicalRequest := strings.Join([]string{
 		req.Method,
 		req.URL.EscapedPath(),
-		"",
+		canonicalQueryFromRaw(req.URL.RawQuery),
 		"host:" + req.URL.Host + "\n" +
-			"x-amz-content-sha256:" + emptyPayloadSHA + "\n" +
+			"x-amz-content-sha256:" + payloadSHA + "\n" +
 			"x-amz-date:" + amzDate + "\n",
 		signedHeaders,
-		emptyPayloadSHA,
+		payloadSHA,
 	}, "\n")
 
 	signature := s.signature(amzDate, scope, canonicalRequest)
@@ -154,6 +158,27 @@ func canonicalQueryString(params map[string]string) string {
 		parts = append(parts, escape(k)+"="+escape(params[k]))
 	}
 	return strings.Join(parts, "&")
+}
+
+// canonicalQueryFromRaw normalises a raw query string for signing. It is empty
+// for the object URLs the gateway presigns, but set for bucket subresources.
+func canonicalQueryFromRaw(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return raw
+	}
+	params := make(map[string]string, len(values))
+	for k, v := range values {
+		if len(v) > 0 {
+			params[k] = v[0]
+		} else {
+			params[k] = ""
+		}
+	}
+	return canonicalQueryString(params)
 }
 
 // escapePath encodes a key but keeps the slash separators.

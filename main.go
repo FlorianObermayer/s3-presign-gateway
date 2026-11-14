@@ -27,6 +27,9 @@ var version = "dev"
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	health := flag.Bool("health-check", false, "probe the local /healthz endpoint and exit")
+	setupCORS := flag.Bool("setup-cors", false, "apply, delete or print the bucket CORS rule, then exit")
+	// ACTION keeps the compose service declarative; the flag still wins.
+	action := flag.String("action", env("ACTION", "apply"), "with -setup-cors: apply, delete or show")
 	flag.Parse()
 
 	if *showVersion {
@@ -37,6 +40,16 @@ func main() {
 		if err := probe(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
+		}
+		return
+	}
+	if *setupCORS {
+		cfg, err := loadConfig()
+		if err != nil {
+			log.Fatalf("configuration: %v", err)
+		}
+		if err := runSetupCORS(cfg, *action); err != nil {
+			log.Fatalf("setup-cors: %v", err)
 		}
 		return
 	}
@@ -340,7 +353,7 @@ func (g *gateway) head(w http.ResponseWriter, r *http.Request, key string) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	g.signer.sign(req)
+	g.signer.sign(req, "")
 
 	resp, err := g.client.Do(req)
 	if err != nil {

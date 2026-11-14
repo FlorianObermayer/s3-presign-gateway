@@ -20,7 +20,7 @@ docker:
 # Override the action with: make cors ACTION=show
 ACTION ?= apply
 cors:
-	docker compose run --rm -e ACTION=$(ACTION) cors-setup
+	docker compose run --rm cors-setup
 
 clean:
 	rm -rf bin
