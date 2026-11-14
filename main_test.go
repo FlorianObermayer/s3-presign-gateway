@@ -129,6 +129,11 @@ func TestParseOrigins(t *testing.T) {
 		{name: "wildcard wins", in: "https://a.example,*", want: nil},
 		{name: "missing scheme", in: "a.example", wantErr: true},
 		{name: "with path", in: "https://a.example/app", wantErr: true},
+		// Origins are matched exactly, so a hostname wildcard would never
+		// match. It must be rejected rather than accepted and silently ignored.
+		{name: "hostname wildcard", in: "https://*.example.com", wantErr: true},
+		{name: "hostname wildcard in list", in: "https://a.example,https://*.example.com", wantErr: true},
+		{name: "bare star still works", in: " * ", want: nil},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -151,6 +156,33 @@ func TestParseOrigins(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestParseOriginsWildcardMessage keeps the rejection diagnostic helpful: the
+// error must say what is wrong, otherwise the operator has no idea why startup
+// failed on an origin that looks plausible.
+func TestParseOriginsWildcardMessage(t *testing.T) {
+	_, err := parseOrigins("https://*.example.com")
+	if err == nil {
+		t.Fatal("expected wildcard hostname to be rejected")
+	}
+	for _, want := range []string{"https://*.example.com", "wildcard", "explicitly"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q should mention %q", err, want)
+		}
+	}
+}
+
+// TestParseOriginsAllowsPort guards against over-eager validation: an Origin
+// header includes the port, so a non-default port is a legitimate entry.
+func TestParseOriginsAllowsPort(t *testing.T) {
+	got, err := parseOrigins("https://a.example:8443")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0] != "https://a.example:8443" {
+		t.Fatalf("got %v", got)
 	}
 }
 

@@ -58,6 +58,18 @@ the player:
 -e CORS_ALLOWED_ORIGINS=https://streaming.example.com
 ```
 
+Several origins are comma separated:
+
+```bash
+-e CORS_ALLOWED_ORIGINS=https://streaming.example.com,https://www.example.com
+```
+
+Matching is exact, so wildcard hostnames such as `https://*.example.com` are
+**rejected at startup** — they could never match a real `Origin` header and would
+otherwise fail silently at runtime. Enumerate the subdomains instead, or use `*`
+on its own. A port is part of the origin (`https://example.com:8443`), so entries
+without one only match the default ports.
+
 The browser sends that page's origin on the redirect *and* on the presigned
 request, so both responses need to allow it. Requests without an `Origin` header
 (VLC, ffmpeg, curl) are unaffected.

@@ -188,6 +188,12 @@ func parseOrigins(raw string) ([]string, error) {
 		if u.RawQuery != "" || u.Path != "" || u.User != nil {
 			return nil, fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q must be an origin without a path", entry)
 		}
+		// Origins are matched exactly, so a wildcard can never match a real
+		// Origin header. Reject it instead of failing silently at runtime:
+		// enumerate the subdomains, or use "*" on its own.
+		if strings.Contains(u.Host, "*") {
+			return nil, fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q uses a wildcard, which can never match; list the origins explicitly or use *", entry)
+		}
 
 		if _, ok := seen[entry]; ok {
 			continue
