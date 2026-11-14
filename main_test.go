@@ -38,6 +38,122 @@ func request(g *gateway, method, target string) *http.Response {
 	return rec.Result()
 }
 
+func requestWithOrigin(g *gateway, method, target, origin string) *http.Response {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(method, target, nil)
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	g.ServeHTTP(rec, req)
+	return rec.Result()
+}
+
+func TestCORSDefaultsToWildcard(t *testing.T) {
+	resp := request(testGateway(t, nil), http.MethodGet, "/hls/stream.m3u8")
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("expected wildcard, got %q", got)
+	}
+	if got := resp.Header.Get("Vary"); got != "" {
+		t.Fatalf("wildcard must not set Vary, got %q", got)
+	}
+}
+
+func TestCORSAllowsConfiguredOrigin(t *testing.T) {
+	g := testGateway(t, func(c *config) {
+		c.corsOrigins = []string{"https://streaming.example.com"}
+	})
+	resp := requestWithOrigin(g, http.MethodGet, "/hls/stream.m3u8", "https://streaming.example.com")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://streaming.example.com" {
+		t.Fatalf("expected echoed origin, got %q", got)
+	}
+	if got := resp.Header.Get("Vary"); !strings.Contains(got, "Origin") {
+		t.Fatalf("expected Vary: Origin, got %q", got)
+	}
+}
+
+func TestCORSRejectsOtherOrigins(t *testing.T) {
+	g := testGateway(t, func(c *config) {
+		c.corsOrigins = []string{"https://streaming.example.com"}
+	})
+	resp := requestWithOrigin(g, http.MethodGet, "/hls/stream.m3u8", "https://evil.example.com")
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("expected no CORS header, got %q", got)
+	}
+	// The redirect is still issued; the browser blocks it without the header.
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Vary"); !strings.Contains(got, "Origin") {
+		t.Fatalf("expected Vary: Origin, got %q", got)
+	}
+}
+
+func TestCORSIgnoresRequestsWithoutOrigin(t *testing.T) {
+	g := testGateway(t, func(c *config) {
+		c.corsOrigins = []string{"https://streaming.example.com"}
+	})
+	// Native players send no Origin and still need the redirect.
+	resp := request(g, http.MethodGet, "/hls/stream.m3u8")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("expected no CORS header, got %q", got)
+	}
+}
+
+func TestParseOrigins(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    []string
+		wantErr bool
+	}{
+		{name: "wildcard", in: "*", want: nil},
+		{name: "empty means wildcard", in: "", want: nil},
+		{name: "single", in: "https://a.example", want: []string{"https://a.example"}},
+		{name: "multiple with spaces", in: " https://a.example , https://b.example ", want: []string{"https://a.example", "https://b.example"}},
+		{name: "trailing slash", in: "https://a.example/", want: []string{"https://a.example"}},
+		{name: "duplicates", in: "https://a.example,https://a.example", want: []string{"https://a.example"}},
+		{name: "wildcard wins", in: "https://a.example,*", want: nil},
+		{name: "missing scheme", in: "a.example", wantErr: true},
+		{name: "with path", in: "https://a.example/app", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseOrigins(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", tc.in)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
 func TestRedirectIsPresignedAndCORSReadable(t *testing.T) {
 	resp := request(testGateway(t, nil), http.MethodGet, "/hls/stream.m3u8")
 	defer resp.Body.Close()

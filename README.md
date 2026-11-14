@@ -47,7 +47,20 @@ curl -i localhost:8080/hls/0/segment.ts
 | `S3_PATH_STYLE` | `true` | `true`: `host/bucket/key`. `false`: `bucket.host/key`. |
 | `ALLOW_PREFIX` | — | Only serve keys under this prefix. Empty = whole bucket. |
 | `PRESIGN_TTL_SECONDS` | `300` | Presigned URL lifetime, 1–604800. |
+| `CORS_ALLOWED_ORIGINS` | `*` | Comma separated origins allowed to read the stream. |
 | `LISTEN_ADDR` | `:8080` | Listen address. |
+
+`CORS_ALLOWED_ORIGINS` is used by the gateway **and** by the CORS setup task, so
+the redirect and the bucket rule always agree. Pin both to the page that embeds
+the player:
+
+```bash
+-e CORS_ALLOWED_ORIGINS=https://streaming.example.com
+```
+
+The browser sends that page's origin on the redirect *and* on the presigned
+request, so both responses need to allow it. Requests without an `Origin` header
+(VLC, ffmpeg, curl) are unaffected.
 
 ## Endpoints
 
@@ -123,7 +136,7 @@ make cors ACTION=delete    # remove it
 | `ACTION` | `apply` | `apply`, `delete` or `show`. |
 | `S3_ACCESS_KEY_ID` | — | **Required.** Falls back to `AWS_ACCESS_KEY_ID`. Needs `PutBucketCors`. |
 | `S3_SECRET_ACCESS_KEY` | — | **Required.** Falls back to `AWS_SECRET_ACCESS_KEY`. |
-| `CORS_ALLOWED_ORIGINS` | `*` | Comma separated origins. |
+| `CORS_ALLOWED_ORIGINS` | `*` | Comma separated origins. Shared with the gateway, so one value configures both. |
 | `CORS_ALLOWED_METHODS` | `GET,HEAD` | |
 | `CORS_ALLOWED_HEADERS` | `*` | |
 | `CORS_EXPOSE_HEADERS` | `ETag,Content-Length,Content-Range,Accept-Ranges` | |

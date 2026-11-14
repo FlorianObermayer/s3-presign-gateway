@@ -104,6 +104,8 @@ type config struct {
 	pathStyle bool
 	ttl       time.Duration
 	prefix    string
+	// corsOrigins is empty when every origin is allowed.
+	corsOrigins []string
 }
 
 func loadConfig() (*config, error) {
@@ -154,7 +156,50 @@ func loadConfig() (*config, error) {
 		cfg.ttl = time.Duration(secs) * time.Second
 	}
 
+	origins, err := parseOrigins(env("CORS_ALLOWED_ORIGINS", "*"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.corsOrigins = origins
+
 	return cfg, nil
+}
+
+// parseOrigins turns a comma separated origin list into a slice. "*" yields
+// nil, which means every origin is permitted. Entries must be absolute
+// http(s) origins, so a typo fails at startup instead of silently at runtime.
+func parseOrigins(raw string) ([]string, error) {
+	var origins []string
+	seen := make(map[string]struct{})
+
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimRight(strings.TrimSpace(entry), "/")
+		if entry == "" {
+			continue
+		}
+		if entry == "*" {
+			return nil, nil
+		}
+
+		u, err := url.Parse(entry)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return nil, fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q must look like https://host", entry)
+		}
+		if u.RawQuery != "" || u.Path != "" || u.User != nil {
+			return nil, fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q must be an origin without a path", entry)
+		}
+
+		if _, ok := seen[entry]; ok {
+			continue
+		}
+		seen[entry] = struct{}{}
+		origins = append(origins, entry)
+	}
+
+	if len(origins) == 0 {
+		return nil, nil
+	}
+	return origins, nil
 }
 
 func env(key, fallback string) string {
@@ -209,7 +254,14 @@ func newGateway(cfg *config) *gateway {
 
 func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
-	h.Set("Access-Control-Allow-Origin", "*")
+	if origin := g.allowedOrigin(r.Header.Get("Origin")); origin != "" {
+		h.Set("Access-Control-Allow-Origin", origin)
+	}
+	// With a fixed origin list the response depends on the request's Origin,
+	// so caches must not reuse it across origins.
+	if len(g.cfg.corsOrigins) > 0 {
+		h.Add("Vary", "Origin")
+	}
 	h.Set("Access-Control-Expose-Headers", "ETag, Content-Length, Content-Range, Accept-Ranges")
 
 	if r.URL.Path == "/healthz" {
@@ -238,6 +290,26 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.Set("Allow", "GET, HEAD, OPTIONS")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// allowedOrigin returns the Access-Control-Allow-Origin value for the request's
+// Origin, or "" when it is not permitted. The browser sends the page's origin on
+// both the gateway request and the presigned request, so this should list the
+// same origins as the bucket CORS rule.
+func (g *gateway) allowedOrigin(origin string) string {
+	if len(g.cfg.corsOrigins) == 0 {
+		return "*"
+	}
+	if origin == "" {
+		return ""
+	}
+	origin = strings.TrimRight(origin, "/")
+	for _, allowed := range g.cfg.corsOrigins {
+		if strings.EqualFold(allowed, origin) {
+			return origin
+		}
+	}
+	return ""
 }
 
 func (g *gateway) redirect(w http.ResponseWriter, key string) {
