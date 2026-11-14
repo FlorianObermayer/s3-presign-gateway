@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,8 @@ func testGateway(t *testing.T, mutate func(*config)) *gateway {
 		pathStyle: true,
 		ttl:       5 * time.Minute,
 		prefix:    "hls",
+		// Mirrors the production default.
+		proxySuffixes: []string{".m3u8"},
 	}
 	if mutate != nil {
 		mutate(cfg)
@@ -400,7 +403,7 @@ func TestParseTokens(t *testing.T) {
 	}
 }
 
-// --- HLS playlists ---------------------------------------------------------
+// --- proxied objects -------------------------------------------------------
 
 func readBody(t *testing.T, resp *http.Response) string {
 	t.Helper()
@@ -411,9 +414,9 @@ func readBody(t *testing.T, resp *http.Response) string {
 	return string(b)
 }
 
-// playlistUpstream answers every request with a small VOD playlist whose
-// segment URIs are relative, the way Owncast writes them.
-func playlistUpstream(t *testing.T, method, query *string) *httptest.Server {
+// upstreamManifest serves a small HLS manifest whose segment URIs are relative,
+// the way Owncast writes them.
+func upstreamManifest(t *testing.T, method, query *string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		*method, *query = r.Method, r.URL.RawQuery
@@ -423,13 +426,10 @@ func playlistUpstream(t *testing.T, method, query *string) *httptest.Server {
 	}))
 }
 
-// TestPlaylistIsServedAndRewritten is the regression test for the bug that a
-// redirect leaves the browser on the storage host: relative segment URIs then
-// resolve there, unsigned, and every segment is rejected with 403.
-func TestPlaylistIsServedAndRewritten(t *testing.T) {
+func upstreamGateway(t *testing.T, cfg func(*config)) (*gateway, func()) {
+	t.Helper()
 	var method, query string
-	upstream := playlistUpstream(t, &method, &query)
-	defer upstream.Close()
+	upstream := upstreamManifest(t, &method, &query)
 
 	endpoint, err := url.Parse(upstream.URL)
 	if err != nil {
@@ -437,23 +437,41 @@ func TestPlaylistIsServedAndRewritten(t *testing.T) {
 	}
 	g := testGateway(t, func(c *config) {
 		c.endpoint = endpoint
-		c.accessTokens = [][]byte{[]byte("s3cr3t-token-value-1234")}
+		if cfg != nil {
+			cfg(c)
+		}
 	})
+	return g, func() { upstream.Close() }
+}
 
-	resp := request(g, http.MethodGet, "/s3cr3t-token-value-1234/hls/1/stream.m3u8")
+// TestManifestIsProxied is the regression test for the bug that a redirect
+// leaves the browser on the storage host: relative segment URIs then resolve
+// there, unsigned, and every segment is rejected with 403.
+func TestManifestIsProxied(t *testing.T) {
+	var method, query string
+	upstream := upstreamManifest(t, &method, &query)
+	defer upstream.Close()
+
+	endpoint, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := testGateway(t, func(c *config) { c.endpoint = endpoint })
+
+	resp := request(g, http.MethodGet, "/hls/1/stream.m3u8")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 	if loc := resp.Header.Get("Location"); loc != "" {
-		t.Fatalf("a playlist must be served, not redirected: %s", loc)
+		t.Fatalf("a manifest must be served, not redirected: %s", loc)
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "application/vnd.apple.mpegurl" {
-		t.Fatalf("unexpected content type %q", ct)
+		t.Fatalf("upstream content type not forwarded, got %q", ct)
 	}
 	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
-		t.Fatalf("playlists must not be cached, got %q", got)
+		t.Fatalf("proxied responses must not be cached, got %q", got)
 	}
 	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Fatalf("missing CORS header, got %q", got)
@@ -462,22 +480,56 @@ func TestPlaylistIsServedAndRewritten(t *testing.T) {
 		t.Fatalf("upstream request was not a presigned GET: %s %q", method, query)
 	}
 
+	// The body is forwarded byte for byte. Rewriting it would require knowing
+	// the format, which is exactly what this design avoids.
 	body := readBody(t, resp)
-	// The token must survive: the browser requests these URIs next.
-	for _, want := range []string{
-		"/s3cr3t-token-value-1234/hls/1/stream-abc-1.ts",
-		"/s3cr3t-token-value-1234/hls/1/stream-abc-2.ts",
-	} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("body missing %q:\n%s", want, body)
-		}
-	}
-	if strings.Contains(body, "\nstream-abc-1.ts") {
-		t.Fatalf("relative URI left unrewritten:\n%s", body)
+	if !strings.Contains(body, "\nstream-abc-1.ts") {
+		t.Fatalf("body was modified:\n%s", body)
 	}
 }
 
-func TestPlaylistUpstreamStatusForwarded(t *testing.T) {
+// TestRelativeReferenceKeepsToken pins the mechanism the design rests on:
+// because the token is a leading path segment, a browser resolving a relative
+// reference against the manifest URL lands back on the gateway with the token
+// intact. No body rewriting is involved.
+func TestRelativeReferenceKeepsToken(t *testing.T) {
+	g, done := upstreamGateway(t, func(c *config) {
+		c.accessTokens = [][]byte{[]byte("s3cr3t-token-value-1234")}
+	})
+	defer done()
+
+	manifestPath := "/s3cr3t-token-value-1234/hls/1/stream.m3u8"
+	resp := request(g, http.MethodGet, manifestPath)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if body := readBody(t, resp); !strings.Contains(body, "stream-abc-1.ts") {
+		t.Fatalf("unexpected body:\n%s", body)
+	}
+
+	// What the browser does with a relative reference.
+	resolved := path.Join(path.Dir(manifestPath), "stream-abc-1.ts")
+	if resolved != "/s3cr3t-token-value-1234/hls/1/stream-abc-1.ts" {
+		t.Fatalf("unexpected resolution: %s", resolved)
+	}
+
+	seg := request(g, http.MethodGet, resolved)
+	defer seg.Body.Close()
+	if seg.StatusCode != http.StatusFound {
+		t.Fatalf("segment via the token path: expected 302, got %d", seg.StatusCode)
+	}
+
+	// The token has to stay in the path, so a rewritten body could not help
+	// either: only a plain path segment survives relative resolution.
+	bare := request(g, http.MethodGet, "/hls/1/stream-abc-1.ts")
+	defer bare.Body.Close()
+	if bare.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 without the token, got %d", bare.StatusCode)
+	}
+}
+
+func TestProxyForwardsUpstreamStatus(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such key", http.StatusNotFound)
 	}))
@@ -499,69 +551,125 @@ func TestPlaylistUpstreamStatusForwarded(t *testing.T) {
 	}
 }
 
-func TestIsPlaylist(t *testing.T) {
-	for _, key := range []string{"a/b.m3u8", "a/b.M3U8"} {
-		if !isPlaylist(key) {
-			t.Fatalf("%q should be a playlist", key)
+// TestProxyForwardsRange covers using the gateway as a plain reverse proxy: a
+// large object read in parts still has to answer 206 correctly.
+func TestProxyForwardsRange(t *testing.T) {
+	var gotRange string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRange = r.Header.Get("Range")
+		w.Header().Set("Content-Range", "bytes 0-3/100")
+		w.Header().Set("Content-Type", "video/mp2t")
+		w.WriteHeader(http.StatusPartialContent)
+		fmt.Fprint(w, "abcd")
+	}))
+	defer upstream.Close()
+
+	endpoint, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := testGateway(t, func(c *config) {
+		c.endpoint = endpoint
+		c.proxyAll = true
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/hls/0/a.ts", nil)
+	req.Header.Set("Range", "bytes=0-3")
+	g.ServeHTTP(rec, req)
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if gotRange != "bytes=0-3" {
+		t.Fatalf("Range not forwarded: %q", gotRange)
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("expected 206, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Range"); got != "bytes 0-3/100" {
+		t.Fatalf("Content-Range not forwarded, got %q", got)
+	}
+	if body := readBody(t, resp); body != "abcd" {
+		t.Fatalf("unexpected body %q", body)
+	}
+}
+
+// TestProxyAllIsFormatAgnostic shows the escape hatch for any manifest format:
+// proxy everything and let relative resolution do the work.
+func TestProxyAllIsFormatAgnostic(t *testing.T) {
+	g, done := upstreamGateway(t, func(c *config) {
+		c.proxyAll = true
+		c.proxySuffixes = nil
+	})
+	defer done()
+
+	// Neither a manifest nor a listed suffix: PROXY_ALL must still proxy it.
+	resp := request(g, http.MethodGet, "/hls/0/segment.ts")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Fatalf("must not redirect: %s", loc)
+	}
+}
+
+func TestProxies(t *testing.T) {
+	suffixes, err := parseSuffixes(".m3u8,.mpd, manifest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &gateway{cfg: &config{proxySuffixes: suffixes}}
+
+	for _, key := range []string{"a/b.m3u8", "a/b.M3U8", "a/b.mpd", "a/b.manifest"} {
+		if !g.proxies(key) {
+			t.Fatalf("%q should be proxied", key)
 		}
 	}
-	for _, key := range []string{"a/b.ts", "a/b.m3u8.txt", "m3u8"} {
-		if isPlaylist(key) {
-			t.Fatalf("%q should not be a playlist", key)
+	// A suffix is matched against the end of the key, so a longer extension
+	// that merely contains it is not enough.
+	for _, key := range []string{"a/b.ts", "a/b.m3u8.txt", "a/bm3u8"} {
+		if g.proxies(key) {
+			t.Fatalf("%q should be redirected", key)
 		}
 	}
 }
 
-func TestRewritePlaylist(t *testing.T) {
-	g := &gateway{}
+func TestParseSuffixes(t *testing.T) {
 	tests := []struct {
-		name string
-		path string
-		in   string
-		want string
+		name    string
+		in      string
+		want    []string
+		wantErr bool
 	}{
-		{
-			name: "relative segments resolved against the directory",
-			path: "/tok/hls/1/stream.m3u8",
-			in:   "#EXTM3U\na.ts\nb.ts\n",
-			want: "#EXTM3U\n/tok/hls/1/a.ts\n/tok/hls/1/b.ts\n",
-		},
-		{
-			name: "nested relative path",
-			path: "/tok/hls/1/stream.m3u8",
-			in:   "sub/c.ts\n",
-			want: "/tok/hls/1/sub/c.ts\n",
-		},
-		{
-			name: "parent traversal is normalised",
-			path: "/tok/hls/1/stream.m3u8",
-			in:   "../0/d.ts\n",
-			want: "/tok/hls/0/d.ts\n",
-		},
-		{
-			name: "absolute paths are left alone",
-			path: "/tok/hls/1/stream.m3u8",
-			in:   "/cdn/e.ts\n",
-			want: "/cdn/e.ts\n",
-		},
-		{
-			name: "absolute URLs are left alone",
-			path: "/tok/hls/1/stream.m3u8",
-			in:   "https://cdn.example/f.ts\n",
-			want: "https://cdn.example/f.ts\n",
-		},
-		{
-			name: "comments and blank lines are untouched",
-			path: "/tok/hls/1/stream.m3u8",
-			in:   "#EXTM3U\n\n#EXT-X-ENDLIST\n",
-			want: "#EXTM3U\n\n#EXT-X-ENDLIST\n",
-		},
+		{name: "empty disables proxying", in: "", want: nil},
+		{name: "single with dot", in: ".m3u8", want: []string{".m3u8"}},
+		{name: "dot is optional", in: "m3u8", want: []string{".m3u8"}},
+		{name: "case is folded", in: ".M3U8", want: []string{".m3u8"}},
+		{name: "list with spaces", in: " .m3u8 , .mpd ", want: []string{".m3u8", ".mpd"}},
+		{name: "empty entries ignored", in: ".m3u8,,", want: []string{".m3u8"}},
+		{name: "slash rejected", in: "a/b", wantErr: true},
+		{name: "space inside rejected", in: "a b", wantErr: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := string(g.rewritePlaylist([]byte(tc.in), tc.path))
-			if got != tc.want {
-				t.Fatalf("got %q, want %q", got, tc.want)
+			got, err := parseSuffixes(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error for %q", tc.in)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
 			}
 		})
 	}

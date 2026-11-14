@@ -1,12 +1,15 @@
 # s3-presign-gateway
 
 Serve objects from a **private** S3-compatible bucket to browsers by redirecting
-to presigned GET URLs, with the CORS headers a redirect needs. HLS playlists
-(`.m3u8`) are the one exception: they are fetched, rewritten and served, so the
-browser stays on the gateway for the segments too.
+to presigned GET URLs, with the CORS headers a redirect needs.
+
+Keys selected by `PROXY_SUFFIXES` (by default HLS manifests, `.m3u8`) are
+streamed through instead, because a response that refers to other objects by
+relative URI does not survive the redirect. Everything else goes to the provider
+directly, so segment bandwidth never touches the gateway.
 
 Written for [Owncast](https://owncast.online) HLS playback on a bucket without
-anonymous access.
+anonymous access, but nothing in it is specific to Owncast.
 
 ## Why
 
@@ -14,12 +17,28 @@ A browser treats the redirect itself as a cross-origin request. Without
 `Access-Control-Allow-Origin` on the `302`, playback fails — even when the bucket
 sends perfect CORS headers on the final response.
 
-Playlists cannot be redirected for a second reason: the segment URIs inside them
-are **relative**, and the browser resolves them against the URL that served the
-playlist. After a redirect that URL is the provider, so the browser asks the
-provider for `stream-x1.ts` with no signature and gets `403`. Serving a rewritten
-playlist keeps every later request on the gateway. Only playlist bytes (a few
-KB) pass through the gateway; segments are still redirected.
+The second problem is relative references. A redirect moves the browser's base URL
+to the provider, so a manifest such as
+
+```
+#EXTM3U
+stream-abc-1.ts
+```
+
+is resolved *there* — unsigned — and every segment comes back `403`. Rewriting
+the body is one answer, but it means teaching the gateway HLS, then DASH, then
+whatever comes next. Keeping the base URL on the gateway is the general one: the
+manifest is streamed through unchanged, so the browser resolves `stream-abc-1.ts`
+against `https://gateway.example.com/<token>/hls/1/stream.m3u8` and asks the
+gateway. The gateway answers `302`, and the segment still comes straight from the
+provider. Only manifest bytes — a few KB per poll — cross the gateway.
+
+No format knowledge is needed because the access token is a **path segment**:
+relative references inherit a path, but not a query string. It is also why the
+token is not a query parameter.
+
+Which keys are streamed is a policy decision: `PROXY_SUFFIXES` (default `.m3u8`),
+or `PROXY_ALL=true` to stop thinking about formats entirely.
 
 The `HEAD` handling exists for the same reason: SigV4 covers the HTTP method, so a
 `HEAD` against a URL signed for `GET` is rejected by the provider.
@@ -67,6 +86,8 @@ bucket rule; see [Setting the rule with `-setup-cors`](#setting-the-rule-with--s
 | `ALLOW_PREFIX` | — | Only serve keys under this prefix. Empty = whole bucket. |
 | `PRESIGN_TTL_SECONDS` | `300` | Presigned URL lifetime, 1–604800. |
 | `CORS_ALLOWED_ORIGINS` | `*` | Comma separated origins allowed to read the stream. |
+| `PROXY_SUFFIXES` | `.m3u8` | Key suffixes to stream instead of redirect. Matched against the end of the key, case insensitively; a leading dot is optional. Empty = redirect everything. |
+| `PROXY_ALL` | `false` | Stream every object. No format list to maintain, at the cost of all bytes crossing the gateway. |
 | `ACCESS_TOKENS` | — | Optional secret path prefix; see [Keeping the URL unlisted](#keeping-the-url-unlisted). |
 | `LISTEN_ADDR` | `:8080` | Listen address. |
 
@@ -126,10 +147,10 @@ https://s3-presigned.example.com/REPLACE-WITH-24-RANDOM-CHARS
 ```
 
 Owncast appends `/hls/0/...` to that string, so playlists become
-`…/REPLACE-WITH-24-RANDOM-CHARS/hls/0/stream.m3u8`. The gateway serves that
-playlist with its relative segment URIs rewritten to
-`…/REPLACE-WITH-24-RANDOM-CHARS/hls/0/<segment>.ts`, so the token propagates to
-every segment with no extra configuration.
+`…/REPLACE-WITH-24-RANDOM-CHARS/hls/0/stream.m3u8`. Because the token is a path
+segment, the manifest's relative segment URIs resolve to
+`…/REPLACE-WITH-24-RANDOM-CHARS/hls/0/<segment>.ts` on their own, so the token
+propagates with no extra configuration and the body needs no rewriting.
 
 A request without the token, or with a wrong one, gets `404` — the same answer
 as a nonexistent key, so the endpoint does not confirm that it exists.
@@ -179,7 +200,7 @@ can check a session — that is a proxy, at the cost of your own bandwidth.
 
 | Path | Response |
 | --- | --- |
-| `GET /<key>.m3u8` | Playlist, fetched and rewritten, `200` |
+| `GET /<key>` (proxied) | Streamed through unchanged, upstream status passed on |
 | `GET /<key>` | `302` to a presigned URL |
 | `HEAD /<key>` | Object metadata (signed as a real `HEAD`) |
 | `OPTIONS /<key>` | CORS preflight, `204` |
@@ -198,6 +219,8 @@ Everything else returns `404` (key outside `ALLOW_PREFIX`) or `405`.
    The field lives under **Server Setup → Server Config → Advanced Settings** →
    *Serving Endpoint*, not in the S3 panel, and Owncast reads it at startup —
    restart it after changing it.
+3. Leave `PROXY_SUFFIXES` at its default so manifests are streamed; segments keep
+   being redirected.
 
 The bucket still needs a CORS rule, because browsers read the final response
 from the provider too:

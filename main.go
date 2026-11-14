@@ -3,6 +3,11 @@
 // A GET on /<key> answers with a 302 to a freshly presigned URL. The redirect
 // carries the CORS headers a browser needs, which the storage provider alone
 // cannot supply.
+//
+// Keys matching PROXY_SUFFIXES (or every key, with PROXY_ALL) are streamed
+// through instead. A redirect changes the browser's base URL to the provider,
+// so any response whose relative references must still reach this gateway - a
+// manifest, a playlist, an HTML page - has to be served from here.
 package main
 
 import (
@@ -18,7 +23,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path"
 	"strconv"
 	"strings"
 	"syscall"
@@ -125,6 +129,11 @@ type config struct {
 	// accessTokens is empty when no token is required. Each entry is a secret
 	// path prefix that must match the first URL segment.
 	accessTokens [][]byte
+	// proxySuffixes lists key suffixes to stream instead of redirect. A suffix
+	// is matched against the end of the key, case insensitively.
+	proxySuffixes []string
+	// proxyAll streams every object, so no format has to be known in advance.
+	proxyAll bool
 }
 
 func loadConfig() (*config, error) {
@@ -187,7 +196,42 @@ func loadConfig() (*config, error) {
 	}
 	cfg.accessTokens = tokens
 
+	suffixes, err := parseSuffixes(env("PROXY_SUFFIXES", ".m3u8"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.proxySuffixes = suffixes
+
+	if v := os.Getenv("PROXY_ALL"); v != "" {
+		cfg.proxyAll, err = strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("PROXY_ALL: %w", err)
+		}
+	}
+
 	return cfg, nil
+}
+
+// parseSuffixes normalises the list of key suffixes that must be served rather
+// than redirected. A leading dot is optional, so "m3u8" and ".m3u8" are the
+// same, and the suffix is matched against the end of the key rather than being
+// treated as an extension.
+func parseSuffixes(raw string) ([]string, error) {
+	var suffixes []string
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.ToLower(strings.TrimSpace(entry))
+		if entry == "" {
+			continue
+		}
+		if strings.ContainsAny(entry, "/\\?# ") {
+			return nil, fmt.Errorf("PROXY_SUFFIXES entry %q must not contain slashes, whitespace or URL punctuation", entry)
+		}
+		if !strings.HasPrefix(entry, ".") {
+			entry = "." + entry
+		}
+		suffixes = append(suffixes, entry)
+	}
+	return suffixes, nil
 }
 
 // minTokenLength keeps a shared secret out of brute-force range. 16 characters
@@ -299,7 +343,24 @@ func newGateway(cfg *config) *gateway {
 			pathStyle: cfg.pathStyle,
 		},
 		client: &http.Client{
-			Timeout: 10 * time.Second,
+			// No overall Timeout: a proxied object may stream for far longer
+			// than any sane total deadline. The per-phase limits still bound a
+			// stalled upstream, and the request context ends the transfer when
+			// the browser disconnects.
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   5 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          100,
+				MaxIdleConnsPerHost:   32,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   5 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+				ResponseHeaderTimeout: 10 * time.Second,
+			},
 			// A signature is bound to its request; never follow redirects.
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
@@ -342,11 +403,12 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		// A playlist is served, not redirected: the browser resolves the
-		// relative segment URIs against the URL that served the playlist, so
-		// after a redirect they would hit the storage host without a signature.
-		if isPlaylist(key) {
-			g.servePlaylist(w, r, key)
+		// A manifest cannot be redirected: the browser would resolve its
+		// relative references against the provider, where they arrive
+		// unsigned. Serving it from here keeps the base URL - and therefore
+		// the access token - on the gateway.
+		if g.proxies(key) {
+			g.proxy(w, r, key)
 			return
 		}
 		g.redirect(w, key)
@@ -424,20 +486,31 @@ func (g *gateway) head(w http.ResponseWriter, r *http.Request, key string) {
 	w.WriteHeader(resp.StatusCode)
 }
 
-// isPlaylist reports whether key is an HLS playlist that needs its relative
-// URIs rewritten.
-func isPlaylist(key string) bool {
-	return strings.HasSuffix(strings.ToLower(key), ".m3u8")
+// proxies reports whether key must be streamed through the gateway instead of
+// redirected. A redirect moves the browser to the provider, so anything the
+// response refers to by relative URI would be resolved there, without a
+// signature. Which keys those are is a policy decision, hence the config.
+func (g *gateway) proxies(key string) bool {
+	if g.cfg.proxyAll {
+		return true
+	}
+	lower := strings.ToLower(key)
+	for _, suffix := range g.cfg.proxySuffixes {
+		if strings.HasSuffix(lower, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
-// servePlaylist fetches an HLS playlist and rewrites it so every relative URI
-// points back at this gateway instead of at the storage host.
+// proxy streams an object through the gateway unchanged.
 //
-// Redirecting a playlist does not work: the browser resolves the relative
-// segment URIs against the URL it fetched the playlist from, which after the
-// redirect is the provider, and those requests carry no signature. Serving the
-// playlist itself keeps the browser on the gateway for the next hop too.
-func (g *gateway) servePlaylist(w http.ResponseWriter, r *http.Request, key string) {
+// It deliberately does not parse the body. The access token is a path segment,
+// so every relative reference in the response resolves back to this gateway
+// with the token still in place, whatever the format. That is what makes this
+// work for HLS, DASH or any future manifest without teaching the gateway a
+// single thing about them.
+func (g *gateway) proxy(w http.ResponseWriter, r *http.Request, key string) {
 	presigned, err := g.signer.presign(key, g.cfg.ttl)
 	if err != nil {
 		log.Printf("presign %q: %v", key, err)
@@ -450,59 +523,42 @@ func (g *gateway) servePlaylist(w http.ResponseWriter, r *http.Request, key stri
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	// Range must survive: in proxy mode this can be a large object that the
+	// player reads in parts, and a manifest may be revalidated conditionally.
+	if v := r.Header.Get("Range"); v != "" {
+		req.Header.Set("Range", v)
+	}
+	if v := r.Header.Get("If-None-Match"); v != "" {
+		req.Header.Set("If-None-Match", v)
+	}
+	if v := r.Header.Get("If-Modified-Since"); v != "" {
+		req.Header.Set("If-Modified-Since", v)
+	}
+
 	resp, err := g.client.Do(req)
 	if err != nil {
-		log.Printf("fetch playlist %q: %v", key, err)
+		log.Printf("proxy %q: %v", key, err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		w.WriteHeader(resp.StatusCode)
-		return
+	for _, name := range []string{
+		"Content-Type", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified",
+	} {
+		if v := resp.Header.Get(name); v != "" {
+			w.Header().Set(name, v)
+		}
 	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		log.Printf("read playlist %q: %v", key, err)
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
+	if resp.ContentLength >= 0 && resp.StatusCode != http.StatusNoContent {
+		w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
 	}
-
-	rewritten := g.rewritePlaylist(body, r.URL.Path)
-
-	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
+	// A presigned URL expires, so the response is only as fresh as it is.
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(rewritten)
-}
-
-// rewritePlaylist turns relative playlist URIs into paths on this gateway.
-// Absolute URIs and comments are left alone, so a playlist that already points
-// somewhere (a CDN, say) keeps working.
-//
-// requestPath must still carry the access token: the rewritten URIs are
-// requested by the browser next, and without the token they would 404.
-func (g *gateway) rewritePlaylist(body []byte, requestPath string) []byte {
-	base := "/"
-	if i := strings.LastIndex(requestPath, "/"); i >= 0 {
-		base = requestPath[:i+1]
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("proxy %q: %v", key, err)
 	}
-
-	lines := strings.Split(string(body), "\n")
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		if strings.Contains(trimmed, "://") || strings.HasPrefix(trimmed, "/") {
-			continue
-		}
-		// Resolve against the playlist's directory, normalising any ../.
-		lines[i] = path.Join(base, trimmed)
-	}
-	return []byte(strings.Join(lines, "\n"))
 }
 
 // stripToken removes a leading access token from the request path.

@@ -26,6 +26,10 @@ services:
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
       ALLOW_PREFIX: ${ALLOW_PREFIX:-hls/}
       PRESIGN_TTL_SECONDS: ${PRESIGN_TTL_SECONDS:-300}
+      # Keys to stream instead of redirect: their relative URIs must resolve
+      # back to the gateway. Empty redirects everything, PROXY_ALL streams all.
+      PROXY_SUFFIXES: ${PROXY_SUFFIXES:-.m3u8}
+      PROXY_ALL: ${PROXY_ALL:-false}
       # Optional: a secret path prefix that every request must carry.
       ACCESS_TOKENS: ${ACCESS_TOKENS:-}
       # Keep this identical to the bucket CORS rule: the browser sends the
