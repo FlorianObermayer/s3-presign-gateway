@@ -1,4 +1,15 @@
-# Portainer stack / docker compose. Build locally with: docker compose up -d --build
+# Docker Compose deployment.
+#
+#   cp .env.example .env     # then fill in the values
+#   docker compose up -d
+#
+# The `cors-setup` service is opt-in behind a profile, so `up` only starts the
+# gateway. Run it explicitly when the bucket rule needs writing:
+#
+#   docker compose run --rm cors-setup
+#   docker compose run --rm -e ACTION=show cors-setup
+#
+# Or, where `compose run` is unavailable: COMPOSE_PROFILES=setup docker compose up -d
 services:
   gateway:
     image: ghcr.io/florianobermayer/s3-presign-gateway:latest
@@ -25,14 +36,10 @@ services:
       - ALL
 
   # One-off task that writes the bucket CORS rule. It needs a write-capable key,
-  # so it is opt-in: it only runs when you ask for it, and the gateway never
-  # sees these credentials. Uses the same image as the gateway.
+  # so it is opt-in: it only runs when asked, and the gateway never sees these
+  # credentials. Same image as the gateway, invoked with -setup-cors.
   #
-  #   docker compose run --rm cors-setup                         # apply
-  #   docker compose run --rm -e ACTION=show cors-setup           # inspect
-  #   docker compose run --rm -e ACTION=delete cors-setup         # remove
-  #
-  # Afterwards delete S3_ADMIN_* from the stack.
+  # Afterwards remove S3_ADMIN_* from the deployment.
   cors-setup:
     profiles: ["setup"]
     image: ghcr.io/florianobermayer/s3-presign-gateway:latest

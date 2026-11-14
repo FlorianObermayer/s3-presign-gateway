@@ -35,6 +35,16 @@ curl -i localhost:8080/hls/0/segment.ts
 # Access-Control-Allow-Origin: *
 ```
 
+Or with compose:
+
+```bash
+cp .env.example .env     # then fill in the values
+docker compose up -d
+```
+
+`compose.yaml` also contains the opt-in `cors-setup` service used to write the
+bucket rule; see [Setting the rule with `-setup-cors`](#setting-the-rule-with--setup-cors).
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -145,19 +155,44 @@ make cors ACTION=show      # print the current rule
 make cors ACTION=delete    # remove it
 ```
 
-### Running it in Portainer
+The compose file puts this service in a `setup` profile, so a normal
+`docker compose up` never starts it — only `docker compose run` does, because
+naming a service explicitly bypasses the profile filter. That is what `make
+cors` uses.
 
-Portainer has no `compose run`, so use a throwaway container:
+If the environment where you run the stack has no `docker compose run` (a
+compose-based UI, a CI job, a one-shot runner), enable the profile for a single
+`up` instead:
 
-1. **Containers → Add container**
-2. Image: `ghcr.io/florianobermayer/s3-presign-gateway:latest`
-3. **Override → Command:** `-setup-cors`
-4. Add the environment variables below (use the *Advanced mode* bulk editor)
-5. **Deploy the container** — it runs once, prints the rule, and exits
-6. Remove the container when done
+```bash
+COMPOSE_PROFILES=setup docker compose up -d    # runs the task once, then it exits
+docker compose up -d                           # back to gateway only
+```
 
-Start with `ACTION=show` to inspect without changing anything, then run again
-with `ACTION=apply`.
+`COMPOSE_PROFILES` can also be placed in the `.env` file next to the compose
+file. While it is set, every `up` re-runs the task — harmless (it is
+idempotent), but remove it afterwards so routine restarts stay a single
+service.
+
+### Running the task as a plain container
+
+Any container runtime can run it, with no compose involved:
+
+```bash
+docker run --rm \
+  -e S3_ENDPOINT=https://de-fra.i3storage.com \
+  -e S3_REGION=de-fra \
+  -e S3_BUCKET=example-bucket \
+  -e S3_ACCESS_KEY_ID=... \
+  -e S3_SECRET_ACCESS_KEY=... \
+  -e CORS_ALLOWED_ORIGINS=https://streaming.example.com \
+  -e ACTION=show \
+  ghcr.io/florianobermayer/s3-presign-gateway:latest -setup-cors
+```
+
+Start with `ACTION=show` to inspect without changing anything, then run the
+same command with `ACTION=apply`. The container exits when done; nothing has to
+be cleaned up.
 
 | Variable | Default | Description |
 | --- | --- | --- |
